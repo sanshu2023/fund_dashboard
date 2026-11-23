@@ -20,8 +20,27 @@ INDEX_POOL = {
 # ---------------- 数据获取（带缓存，1小时内不重复请求） ----------------
 @st.cache_data(ttl=3600, show_spinner="正在从指数官网获取数据...")
 def get_index_data(code: str) -> pd.DataFrame:
-    df = ak.stock_zh_index_value_csindex(symbol=code)
-    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    # akshare 1.20.44 起，stock_zh_index_value_csindex 更名为 index_value_csindex
+    try:
+        try:
+            df = ak.index_value_csindex(symbol=code)        # 新版接口
+        except TypeError:
+            df = ak.index_value_csindex(code)               # 参数名变了时兜底
+    except AttributeError:
+        df = ak.stock_zh_index_value_csindex(symbol=code)   # 旧版接口兜底
+
+    df.columns = [str(c) for c in df.columns]
+
+    # 自动定位「日期」列（不同版本可能是 trade_date / date / 日期）
+    date_col = next((c for c in ["trade_date", "date", "日期", "交易日"] if c in df.columns), None)
+    # 自动定位「市盈率」列（不同版本可能是 pe_ttm / pe1 / 市盈率1 等）
+    pe_col = next((c for c in ["pe_ttm", "pe1", "pe2", "市盈率1", "市盈率", "市盈率TTM"] if c in df.columns), None)
+
+    if date_col is None or pe_col is None:
+        raise ValueError(f"列名不匹配，实际列名为：{list(df.columns)}")
+
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.rename(columns={date_col: "trade_date", pe_col: "pe_ttm"})
     return df.sort_values("trade_date").dropna(subset=["pe_ttm"]).reset_index(drop=True)
 
 @st.cache_data(ttl=3600, show_spinner="正在获取国债收益率...")
