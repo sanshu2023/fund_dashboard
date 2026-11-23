@@ -161,19 +161,20 @@ st.divider()
 
 # ---------------- 汇总表格 ----------------
 st.subheader("📋 指标汇总")
+pct_col = f"百分位({years}年)"
 table = pd.DataFrame([
     {
         "指数": m["指数"],
         "数据日期": m["数据日期"],
         "PE-TTM": m["PE-TTM"],
-        f"百分位({years}年)": m["百分位"],
+        pct_col: m["百分位"],
         "评级": level(m["百分位"])[0],
         "盈利收益率": f'{m["盈利收益率"]:.2%}',
         "股债利差": f'{m["股债利差"]:.2%}',
         "格雷厄姆指数": round(m["格雷厄姆指数"], 2),
     }
     for m in metrics_list
-]).sort_values("百分位")
+]).sort_values(pct_col)
 st.dataframe(table, use_container_width=True, hide_index=True)
 st.caption("百分位越低 = 当前估值在历史上越便宜；股债利差 = 盈利收益率 − 10Y国债收益率")
 
