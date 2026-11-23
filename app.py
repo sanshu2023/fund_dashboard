@@ -18,30 +18,28 @@ INDEX_POOL = {
 }
 
 # ---------------- 数据获取（带缓存，1小时内不重复请求） ----------------
-@st.cache_data(ttl=3600, show_spinner="正在从指数官网获取数据...")
-def get_index_data(code: str) -> pd.DataFrame:
-    # akshare 1.20.44 起，stock_zh_index_value_csindex 更名为 index_value_csindex
+@st.cache_data(ttl=3600, show_spinner="正在获取国债收益率...")
+def get_bond_series() -> pd.Series:
+    """返回「日期 → 10年期国债收益率(小数)」的时间序列"""
+    # akshare 1.20.41 起，bond_zh_us_rate 更名为 bond_zh_us_yield_em
     try:
-        try:
-            df = ak.index_value_csindex(symbol=code)        # 新版接口
-        except TypeError:
-            df = ak.index_value_csindex(code)               # 参数名变了时兜底
+        bond = ak.bond_zh_us_yield_em()                    # 新版接口
     except AttributeError:
-        df = ak.stock_zh_index_value_csindex(symbol=code)   # 旧版接口兜底
+        bond = ak.bond_zh_us_rate(start_date="20150101")   # 旧版兜底
 
-    df.columns = [str(c) for c in df.columns]
+    bond.columns = [str(c) for c in bond.columns]
+    candidates = [c for c in bond.columns if "10" in c and "国债" in c] or \
+                 [c for c in bond.columns if "10" in c]
+    if not candidates:
+        raise ValueError(f"未找到10年期国债收益率列，实际列名为：{list(bond.columns)}")
+    date_col = next((c for c in ["日期", "date", "trade_date"] if c in bond.columns), bond.columns[0])
 
-    # 自动定位「日期」列（不同版本可能是 trade_date / date / 日期）
-    date_col = next((c for c in ["trade_date", "date", "日期", "交易日"] if c in df.columns), None)
-    # 自动定位「市盈率」列（不同版本可能是 pe_ttm / pe1 / 市盈率1 等）
-    pe_col = next((c for c in ["pe_ttm", "pe1", "pe2", "市盈率1", "市盈率", "市盈率TTM"] if c in df.columns), None)
-
-    if date_col is None or pe_col is None:
-        raise ValueError(f"列名不匹配，实际列名为：{list(df.columns)}")
-
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.rename(columns={date_col: "trade_date", pe_col: "pe_ttm"})
-    return df.sort_values("trade_date").dropna(subset=["pe_ttm"]).reset_index(drop=True)
+    s = bond[[date_col, candidates[0]]].dropna().copy()
+    s[date_col] = pd.to_datetime(s[date_col])
+    s = s.set_index(date_col)[candidates[0]].astype(float).sort_index()
+    if s.iloc[-1] > 0.5:   # 单位自适应：百分数 → 小数
+        s = s / 100
+    return s
 
 @st.cache_data(ttl=3600, show_spinner="正在获取国债收益率...")
 def get_r10() -> float:
@@ -90,6 +88,57 @@ def get_metrics(code: str, years: int, r10: float) -> dict:
         "股债利差": earn - r10,
         "格雷厄姆指数": earn / r10,
     }
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_spread_history(code: str, years: int, bond: pd.Series) -> pd.DataFrame:
+    """计算某指数近 N 年每个交易日的股债利差"""
+    df = get_index_data(code)
+    today = df.iloc[-1]["trade_date"]
+    sub = df[df["trade_date"] >= today - pd.DateOffset(years=years)][["trade_date", "pe_ttm"]].copy()
+    sub = sub.set_index("trade_date")
+    sub["盈利收益率"] = 1 / sub["pe_ttm"]
+
+    # 把国债收益率按日期对齐（指数有数据但国债缺数据的日子，用最近一天的值填充）
+    all_idx = sub.index.union(bond.index)
+    sub["r10"] = bond.reindex(all_idx).ffill().reindex(sub.index)
+
+    sub = sub.dropna(subset=["r10"])
+    sub["股债利差"] = sub["盈利收益率"] - sub["r10"]
+    return sub.reset_index()
+
+def spread_chart(hist: pd.DataFrame) -> go.Figure:
+    """股债利差历史折线图"""
+    cur = float(hist["股债利差"].iloc[-1])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hist["trade_date"],
+        y=hist["股债利差"],
+        mode="lines",
+        line=dict(color="#1e88e5", width=2),
+        fill="tozeroy",
+        fillcolor="rgba(30,136,229,0.08)",
+        hovertemplate="%{x|%Y-%m-%d}<br>股债利差：%{y:.2%}<extra></extra>",
+    ))
+    # 最新值高亮标记
+    fig.add_trace(go.Scatter(
+        x=[hist["trade_date"].iloc[-1]],
+        y=[cur],
+        mode="markers+text",
+        marker=dict(color="#e53935", size=8),
+        text=[f"{cur:.2%}"],
+        textposition="top center",
+        showlegend=False,
+        hoverinfo="skip",
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color="#9e9e9e",
+                  annotation_text="利差=0（股债性价比相同）",
+                  annotation_font_size=10, annotation_font_color="#9e9e9e")
+    fig.update_layout(
+        height=320,
+        margin=dict(t=15, b=0, l=10, r=10),
+        yaxis_tickformat=".1%",
+        hovermode="x unified",
+    )
+    return fig
 
 # ---------------- 温度计绘图 ----------------
 def gauge(name: str, pct: float):
@@ -134,7 +183,9 @@ if not selected:
     st.info("👈 请在左侧选择至少一个指数")
     st.stop()
 
-r10 = get_r10()
+bond_series = get_bond_series()
+r10 = float(bond_series.iloc[-1])
+
 
 # ---------------- 逐个计算指标 ----------------
 metrics_list, errors = [], []
@@ -186,3 +237,18 @@ for i in range(0, len(metrics_list), 2):
     for col, m in zip(cols, pair):
         with col:
             st.plotly_chart(gauge(m["指数"], m["百分位"]), use_container_width=True)
+
+# ---------------- 股债利差历史走势 ----------------
+st.divider()
+st.subheader(f"📈 股债利差走势（近{years}年）")
+st.caption("股债利差 = 盈利收益率(1/PE) − 10年期国债收益率，数值越高 = 股票相对债券越值得买；左上角可切换指数")
+
+tabs = st.tabs([m["指数"] for m in metrics_list])
+for tab, m in zip(tabs, metrics_list):
+    with tab:
+        try:
+            hist = get_spread_history(m["code"], years, bond_series)
+            st.caption(f"最新：{hist['trade_date'].iloc[-1].strftime('%Y-%m-%d')} ｜ 股债利差 {hist['股债利差'].iloc[-1]:.2%}")
+            st.plotly_chart(spread_chart(hist), use_container_width=True)
+        except Exception as e:
+            st.warning(f"⚠️ {m['指数']} 走势绘制失败：{e}")
