@@ -1,4 +1,5 @@
 import akshare as ak
+import inspect
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
@@ -19,29 +20,75 @@ INDEX_POOL = {
 
 # ---------------- 数据获取（带缓存，1小时内不重复请求） ----------------
 @st.cache_data(ttl=3600, show_spinner="正在从指数官网获取数据...")
-def get_index_data(code: str) -> pd.DataFrame:
-    # akshare 1.20.44 起，stock_zh_index_value_csindex 更名为 index_value_csindex
+# ---------- 数据源①：中证指数官网（主源，显式传入日期区间） ----------
+def _fetch_csi(code: str) -> pd.DataFrame:
+    if hasattr(ak, "index_value_csindex"):          # 1.20.44+ 新版
+        func = ak.index_value_csindex
+    else:                                           # 旧版兜底
+        func = ak.stock_zh_index_value_csindex
+
+    # 自动探测接口支持的日期参数，显式要「成立以来」全部数据
+    kwargs = {}
+    params = inspect.signature(func).parameters
+    if "start_date" in params:
+        kwargs["start_date"] = "20040101"           # 早于所有指数成立日
+    if "end_date" in params:
+        kwargs["end_date"] = pd.Timestamp.today().strftime("%Y%m%d")
+
     try:
+        return func(symbol=code, **kwargs)
+    except TypeError:
+        return func(code, **kwargs)
+
+# ---------- 数据源②：乐咕乐股（备用） ----------
+LG_FUNC_NAMES = ["index_pe_lg", "stock_index_pe_lg"]   # 新旧版本函数名都试
+LG_NAME_MAP = {
+    "000016": "上证50",   "000300": "沪深300", "000905": "中证500",
+    "000015": "红利指数", "399006": "创业板指", "000852": "中证1000",
+    "000688": "科创50",
+}
+
+def _fetch_lg(code: str) -> pd.DataFrame:
+    if code not in LG_NAME_MAP:
+        raise RuntimeError("该指数暂无备用数据源")
+    last_err = None
+    for fname in LG_FUNC_NAMES:
+        func = getattr(ak, fname, None)
+        if func is None:
+            continue
         try:
-            df = ak.index_value_csindex(symbol=code)        # 新版接口
-        except TypeError:
-            df = ak.index_value_csindex(code)               # 参数名变了时兜底
-    except AttributeError:
-        df = ak.stock_zh_index_value_csindex(symbol=code)   # 旧版接口兜底
+            return func(symbol=LG_NAME_MAP[code])
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"备用数据源不可用：{last_err}")
 
+# ---------- 列名统一 + 主函数 ----------
+def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c) for c in df.columns]
-
-    # 自动定位「日期」列
     date_col = next((c for c in ["trade_date", "date", "日期", "交易日"] if c in df.columns), None)
-    # 自动定位「市盈率」列
-    pe_col = next((c for c in ["pe_ttm", "pe1", "pe2", "市盈率1", "市盈率", "市盈率TTM"] if c in df.columns), None)
-
+    pe_col = next((c for c in ["pe_ttm", "pe1", "市盈率", "市盈率TTM"] if c in df.columns), None)
+    if pe_col is None:
+        pe_col = next((c for c in df.columns if "pe" in c.lower() or "市盈率" in c), None)
     if date_col is None or pe_col is None:
         raise ValueError(f"列名不匹配，实际列名为：{list(df.columns)}")
-
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.rename(columns={date_col: "trade_date", pe_col: "pe_ttm"})
     return df.sort_values("trade_date").dropna(subset=["pe_ttm"]).reset_index(drop=True)
+
+@st.cache_data(ttl=3600, show_spinner="正在获取指数估值历史...")
+def get_index_data(code: str) -> pd.DataFrame:
+    """数据源依次尝试：中证官网(带日期区间) → 乐咕乐股 → 明确报错"""
+    errors = []
+    for fetcher in (_fetch_csi, _fetch_lg):
+        try:
+            df = _normalize(fetcher(code))
+            span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
+            if span >= 2:            # 历史不足2年视为不合格，换下一个源
+                return df
+            errors.append(f"{fetcher.__name__} 仅返回 {span:.1f} 年数据")
+        except Exception as e:
+            errors.append(f"{fetcher.__name__}：{e}")
+    raise RuntimeError("；".join(errors))
 
 def get_bond_series() -> pd.Series:
     """返回「日期 → 10年期国债收益率(小数)」的时间序列"""
