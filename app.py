@@ -113,77 +113,137 @@ def get_metrics(code: str, years: int, r10: float) -> dict:
         "格雷厄姆指数": earn / r10,
     }
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_spread_history(code: str, years: int, bond: pd.Series) -> pd.DataFrame:
-    """计算某指数近 N 年每个交易日的股债利差"""
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_spread_history(code: str, bond: pd.Series) -> pd.DataFrame:
+    """计算某指数成立以来每个交易日的股债利差及其历史百分位"""
     df = get_index_data(code)
-    today = df.iloc[-1]["trade_date"]
-    sub = df[df["trade_date"] >= today - pd.DateOffset(years=years)][["trade_date", "pe_ttm"]].copy()
-    sub = sub.set_index("trade_date")
+    sub = df[["trade_date", "pe_ttm"]].set_index("trade_date").copy()
     sub["盈利收益率"] = 1 / sub["pe_ttm"]
 
-    # 把国债收益率按日期对齐（指数有数据但国债缺数据的日子，用最近一天的值填充）
+    # 国债收益率按日期对齐，缺失日沿用最近一天
     all_idx = sub.index.union(bond.index)
     sub["r10"] = bond.reindex(all_idx).ffill().reindex(sub.index)
-
     sub = sub.dropna(subset=["r10"])
     sub["股债利差"] = sub["盈利收益率"] - sub["r10"]
+
+    # 成立以来百分位：每天的利差在「截至当天」历史中的分位（不偷看未来数据）
+    sub["百分位"] = sub["股债利差"].expanding(min_periods=2).rank(pct=True) * 100
     return sub.reset_index()
 
 def spread_chart(hist: pd.DataFrame) -> go.Figure:
-    """股债利差历史折线图"""
+    """参考图风格：浅网格 + 柔和分段色 + 线端数值 + 区间快捷切换"""
     cur = float(hist["股债利差"].iloc[-1])
+    cur_pct = float(hist["百分位"].iloc[-1])
+    end_date = hist["trade_date"].iloc[-1]
+
+    def color_for(p):
+        if pd.isna(p): return "#9aa5b1"
+        if p >= 75:    return "#43a047"   # 利差高位 → 便宜 → 绿
+        if p <= 25:    return "#e53935"   # 利差低位 → 贵 → 红
+        return "#1e88e5"                  # 中性 → 蓝
+
+    hist = hist.copy()
+    hist["颜色"] = hist["百分位"].apply(color_for)
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=hist["trade_date"],
-        y=hist["股债利差"],
-        mode="lines",
-        line=dict(color="#1e88e5", width=2),
-        fill="tozeroy",
-        fillcolor="rgba(30,136,229,0.08)",
-        hovertemplate="%{x|%Y-%m-%d}<br>股债利差：%{y:.2%}<extra></extra>",
-    ))
-    # 最新值高亮标记
-    fig.add_trace(go.Scatter(
-        x=[hist["trade_date"].iloc[-1]],
-        y=[cur],
-        mode="markers+text",
-        marker=dict(color="#e53935", size=8),
-        text=[f"{cur:.2%}"],
-        textposition="top center",
-        showlegend=False,
-        hoverinfo="skip",
-    ))
-    fig.add_hline(y=0, line_dash="dash", line_color="#9e9e9e",
-                  annotation_text="利差=0（股债性价比相同）",
-                  annotation_font_size=10, annotation_font_color="#9e9e9e")
-    fig.update_layout(
-        height=320,
-        margin=dict(t=15, b=0, l=10, r=10),
-        yaxis_tickformat=".1%",
-        hovermode="x unified",
+    # 按颜色分段绘制（颜色切换处补连接点，保证曲线连续）
+    start, n = 0, len(hist)
+    for i in range(1, n + 1):
+        if i == n or hist["颜色"].iloc[i] != hist["颜色"].iloc[start]:
+            seg = hist.iloc[max(start - 1, 0): i]
+            fig.add_trace(go.Scatter(
+                x=seg["trade_date"], y=seg["股债利差"], mode="lines",
+                line=dict(color=hist["颜色"].iloc[start], width=1.8),
+                customdata=seg[["百分位"]].values,
+                hovertemplate="%{x|%Y-%m-%d}<br>股债利差：%{y:.2%}<br>成立以来百分位：%{customdata[0]:.0f}%<extra></extra>",
+                showlegend=False,
+            ))
+            start = i
+
+    # 线端最新值标签（对应参考图线末端的数值标注）
+    fig.add_annotation(
+        x=end_date, y=cur, xanchor="left", xshift=6,
+        text=f"<b>{cur:.2%}</b><br><span style='font-size:10px'>{cur_pct:.0f}%分位</span>",
+        showarrow=False, font=dict(color=color_for(cur_pct), size=12),
     )
+
+    # 横轴：按跨度自动均分刻度
+    span_years = (hist["trade_date"].iloc[-1] - hist["trade_date"].iloc[0]).days / 365.25
+    step = min([0.5, 1, 2, 5, 10, 20], key=lambda v: abs(v - span_years / 8))
+    dtick = f"M{int(step * 12)}"
+
+    fig.update_xaxes(
+        dtick=dtick, showgrid=False, linecolor="#cfd8dc",
+        tickfont=dict(color="#78909c", size=11),
+        # 参考图顶部的胶囊切换按钮
+        rangeselector=dict(
+            buttons=[
+                dict(count=1, label="1年", step="year", stepmode="backward"),
+                dict(count=3, label="3年", step="year", stepmode="backward"),
+                dict(count=5, label="5年", step="year", stepmode="backward"),
+                dict(step="all", label="全部"),
+            ],
+            font=dict(size=11, color="#546e7a"),
+            bgcolor="#f5f7fa", activecolor="#dbeafe",
+            bordercolor="#cfd8dc", borderwidth=1,
+        ),
+    )
+    fig.update_yaxes(
+        tickformat=".0%", zeroline=False,
+        gridcolor="#edeef2", griddash="dot", gridwidth=1,   # 横向点状细网格
+        tickfont=dict(color="#78909c", size=11),
+    )
+    fig.update_layout(
+        height=360, hovermode="x unified",
+        margin=dict(t=40, b=5, l=10, r=70),   # 右侧留白给线端标签
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    )
+
+    # 图例色块
+    for label, c in [("利差高位（便宜）", "#43a047"), ("中性", "#1e88e5"), ("利差低位（贵）", "#e53935")]:
+        fig.add_trace(go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(color=c, size=10, symbol="square"), name=label,
+        ))
     return fig
 
+
 # ---------------- 温度计绘图 ----------------
-def gauge(name: str, pct: float):
-    _, color = level(pct)
+def gauge(name: str, pct: float) -> go.Figure:
+    """紧凑型估值温度计：背景三色带 + 大数字 + 状态标签"""
+    if pct < 25:
+        bar, tag = "#2e7d32", "🟢 低温 · 便宜"
+    elif pct <= 75:
+        bar, tag = "#1e88e5", "🔵 常温 · 中性"
+    else:
+        bar, tag = "#c62828", "🔴 高温 · 昂贵"
+
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=pct,
-        number={"suffix": "%", "font": {"size": 30}},
-        title={"text": name, "font": {"size": 16}},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": color, "thickness": 0.3},
-            "steps": [
-                {"range": [0, 30], "color": "#c8e6c9"},   # 绿色区：低估
-                {"range": [30, 70], "color": "#fff9c4"},  # 黄色区：正常
-                {"range": [70, 100], "color": "#ef9a9a"}, # 红色区：高估
+        number=dict(suffix="%", font=dict(size=28, color=bar)),
+        gauge=dict(
+            axis=dict(range=[0, 100], showticklabels=False, tickwidth=0),
+            bar=dict(color=bar, thickness=0.32),
+            borderwidth=0,
+            steps=[
+                dict(range=[0, 25], color="#e8f5e9"),    # 浅绿带
+                dict(range=[25, 75], color="#e3f2fd"),   # 浅蓝带
+                dict(range=[75, 100], color="#ffebee"),  # 浅红带
             ],
-        },
+        ),
+        title=dict(text=f"<b>{name}</b>", font=dict(size=13, color="#455a64")),
     ))
-    fig.update_layout(height=230, margin=dict(t=40, b=0, l=25, r=25))
+    fig.add_annotation(
+        text=f"<b>{tag}</b>", x=0.5, y=-0.18,
+        showarrow=False, font=dict(size=12),
+    )
+    fig.update_layout(
+        height=175, margin=dict(t=10, b=30, l=10, r=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+    )
     return fig
+
 
 # ================== 页面主体 ==================
 st.title("📊 指数估值看板")
@@ -264,15 +324,20 @@ for i in range(0, len(metrics_list), 2):
 
 # ---------------- 股债利差历史走势 ----------------
 st.divider()
-st.subheader(f"📈 股债利差走势（近{years}年）")
-st.caption("股债利差 = 盈利收益率(1/PE) − 10年期国债收益率，数值越高 = 股票相对债券越值得买；左上角可切换指数")
+st.subheader("📈 股债利差走势（指数成立以来）")
+st.caption("股债利差 = 盈利收益率(1/PE) − 10年期国债收益率 ｜ 🟢 利差高位＝相对便宜 · 🔵 中性 · 🔴 利差低位＝相对昂贵")
 
 tabs = st.tabs([m["指数"] for m in metrics_list])
 for tab, m in zip(tabs, metrics_list):
     with tab:
         try:
-            hist = get_spread_history(m["code"], years, bond_series)
-            st.caption(f"最新：{hist['trade_date'].iloc[-1].strftime('%Y-%m-%d')} ｜ 股债利差 {hist['股债利差'].iloc[-1]:.2%}")
+            hist = get_spread_history(m["code"], bond_series)
+            cur_pct = hist["百分位"].iloc[-1]
+            st.caption(
+                f"最新：{hist['trade_date'].iloc[-1].strftime('%Y-%m-%d')} ｜ "
+                f"股债利差 {hist['股债利差'].iloc[-1]:.2%} ｜ "
+                f"成立以来百分位 {cur_pct:.0f}%"
+            )
             st.plotly_chart(spread_chart(hist), use_container_width=True)
         except Exception as e:
             st.warning(f"⚠️ {m['指数']} 走势绘制失败：{e}")
