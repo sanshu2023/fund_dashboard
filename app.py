@@ -39,18 +39,18 @@ def _fetch_csi(code: str) -> pd.DataFrame:
         return func(symbol=code, **kwargs)
     except TypeError:
         return func(code, **kwargs)
-
+    
 # ---------- 数据源②：乐咕乐股（备用） ----------
 LG_FUNC_NAMES = ["index_pe_lg", "stock_index_pe_lg"]   # 新旧版本函数名都试
 LG_NAME_MAP = {
-    "000016": "上证50",   "000300": "沪深300", "000905": "中证500",
-    "000015": "红利指数", "399006": "创业板指", "000852": "中证1000",
-    "000688": "科创50",
+    "000016": "上证50", "000300": "沪深300", "000905": "中证500",
+    "000015": "上证红利", "399006": "创业板指", "000852": "中证1000",
+    "000688": "科创50", "000922": "中证红利",
 }
 
 def _fetch_lg(code: str) -> pd.DataFrame:
     if code not in LG_NAME_MAP:
-        raise RuntimeError("该指数暂无备用数据源")
+        raise RuntimeError("该数据源不支持此指数")
     last_err = None
     for fname in LG_FUNC_NAMES:
         func = getattr(ak, fname, None)
@@ -60,7 +60,26 @@ def _fetch_lg(code: str) -> pd.DataFrame:
             return func(symbol=LG_NAME_MAP[code])
         except Exception as e:
             last_err = e
-    raise RuntimeError(f"备用数据源不可用：{last_err}")
+    raise RuntimeError(f"不可用：{last_err}")
+
+# ---------- 数据源③：韭圈儿（备用，覆盖主题指数） ----------
+FUNDDB_NAME_MAP = {
+    "000922": "中证红利", "000015": "上证红利", "000932": "中证消费",
+    "000300": "沪深300", "000905": "中证500", "000016": "上证50",
+    "399006": "创业板指", "000852": "中证1000", "000688": "科创50",
+}
+
+def _fetch_funddb(code: str) -> pd.DataFrame:
+    if code not in FUNDDB_NAME_MAP:
+        raise RuntimeError("该数据源不支持此指数")
+    func = getattr(ak, "index_value_hist_funddb", None)
+    if func is None:
+        raise RuntimeError("当前 akshare 版本无此接口")
+    try:
+        return func(symbol=FUNDDB_NAME_MAP[code], indicator="市盈率")
+    except TypeError:
+        return func(FUNDDB_NAME_MAP[code], "市盈率")
+
 
 # ---------- 列名统一 + 主函数 ----------
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
@@ -77,9 +96,9 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl=3600, show_spinner="正在获取指数估值历史...")
 def get_index_data(code: str) -> pd.DataFrame:
-    """数据源依次尝试：中证官网(带日期区间) → 乐咕乐股 → 明确报错"""
+    """数据源依次尝试：中证官网(带日期区间) → 乐咕乐股 → 韭圈儿 → 明确报错"""
     errors = []
-    for fetcher in (_fetch_csi, _fetch_lg):
+    for fetcher in (_fetch_csi, _fetch_lg, _fetch_funddb):
         try:
             df = _normalize(fetcher(code))
             span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
@@ -178,7 +197,7 @@ def get_spread_history(code: str, bond: pd.Series) -> pd.DataFrame:
     return sub.reset_index()
 
 def spread_chart(hist: pd.DataFrame) -> go.Figure:
-    """参考图风格：浅网格 + 柔和分段色 + 线端数值 + 区间快捷切换"""
+    """浅网格 + 柔和分段色 + 线端数值 + 图例置于图下方横排"""
     cur = float(hist["股债利差"].iloc[-1])
     cur_pct = float(hist["百分位"].iloc[-1])
     end_date = hist["trade_date"].iloc[-1]
@@ -193,7 +212,6 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
     hist["颜色"] = hist["百分位"].apply(color_for)
 
     fig = go.Figure()
-    # 按颜色分段绘制（颜色切换处补连接点，保证曲线连续）
     start, n = 0, len(hist)
     for i in range(1, n + 1):
         if i == n or hist["颜色"].iloc[i] != hist["颜色"].iloc[start]:
@@ -207,22 +225,20 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
             ))
             start = i
 
-    # 线端最新值标签（对应参考图线末端的数值标注）
+    # 线端最新值标签
     fig.add_annotation(
-        x=end_date, y=cur, xanchor="left", xshift=6,
+        x=end_date, y=cur, xanchor="left", xshift=4,
         text=f"<b>{cur:.2%}</b><br><span style='font-size:10px'>{cur_pct:.0f}%分位</span>",
-        showarrow=False, font=dict(color=color_for(cur_pct), size=12),
+        showarrow=False, font=dict(color=color_for(cur_pct), size=11),
     )
 
     # 横轴：按跨度自动均分刻度
     span_years = (hist["trade_date"].iloc[-1] - hist["trade_date"].iloc[0]).days / 365.25
     step = min([0.5, 1, 2, 5, 10, 20], key=lambda v: abs(v - span_years / 8))
-    dtick = f"M{int(step * 12)}"
 
     fig.update_xaxes(
-        dtick=dtick, showgrid=False, linecolor="#cfd8dc",
+        dtick=f"M{int(step * 12)}", showgrid=False, linecolor="#cfd8dc",
         tickfont=dict(color="#78909c", size=11),
-        # 参考图顶部的胶囊切换按钮
         rangeselector=dict(
             buttons=[
                 dict(count=1, label="1年", step="year", stepmode="backward"),
@@ -237,58 +253,28 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
     )
     fig.update_yaxes(
         tickformat=".0%", zeroline=False,
-        gridcolor="#edeef2", griddash="dot", gridwidth=1,   # 横向点状细网格
+        gridcolor="#edeef2", griddash="dot", gridwidth=1,
         tickfont=dict(color="#78909c", size=11),
     )
     fig.update_layout(
-        height=360, hovermode="x unified",
-        margin=dict(t=40, b=5, l=10, r=70),   # 右侧留白给线端标签
+        height=380, hovermode="x unified",
+        margin=dict(t=40, b=60, l=10, r=42),   # 底部留白给图例，右侧仅留线端标签空间
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(
+            orientation="h",            # 水平排列
+            yanchor="bottom", y=-0.22,  # 移到图表下方
+            xanchor="left", x=0,
+            font=dict(size=11, color="#546e7a"),
+            itemsizing="constant",
+        ),
     )
 
-    # 图例色块
-    for label, c in [("利差高位（便宜）", "#43a047"), ("中性", "#1e88e5"), ("利差低位（贵）", "#e53935")]:
+    # 图例（短文案，适配手机横排）
+    for label, c in [("高位 = 便宜", "#43a047"), ("中性", "#1e88e5"), ("低位 = 贵", "#e53935")]:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="markers",
-            marker=dict(color=c, size=10, symbol="square"), name=label,
+            marker=dict(color=c, size=9, symbol="square"), name=label,
         ))
-    return fig
-
-
-# ---------------- 温度计绘图 ----------------
-def gauge(name: str, pct: float) -> go.Figure:
-    """紧凑型估值温度计：背景三色带 + 大数字 + 状态标签"""
-    if pct < 25:
-        bar, tag = "#2e7d32", "🟢 低温 · 便宜"
-    elif pct <= 75:
-        bar, tag = "#1e88e5", "🔵 常温 · 中性"
-    else:
-        bar, tag = "#c62828", "🔴 高温 · 昂贵"
-
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=pct,
-        number=dict(suffix="%", font=dict(size=28, color=bar)),
-        gauge=dict(
-            axis=dict(range=[0, 100], showticklabels=False, tickwidth=0),
-            bar=dict(color=bar, thickness=0.32),
-            borderwidth=0,
-            steps=[
-                dict(range=[0, 25], color="#e8f5e9"),    # 浅绿带
-                dict(range=[25, 75], color="#e3f2fd"),   # 浅蓝带
-                dict(range=[75, 100], color="#ffebee"),  # 浅红带
-            ],
-        ),
-        title=dict(text=f"<b>{name}</b>", font=dict(size=13, color="#455a64")),
-    ))
-    fig.add_annotation(
-        text=f"<b>{tag}</b>", x=0.5, y=-0.18,
-        showarrow=False, font=dict(size=12),
-    )
-    fig.update_layout(
-        height=175, margin=dict(t=10, b=30, l=10, r=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-    )
     return fig
 
 
