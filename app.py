@@ -96,18 +96,33 @@ def _fetch_funddb(code: str) -> pd.DataFrame:
 
 # ---------- 主取数入口：三级回退 ----------
 @st.cache_data(ttl=3600, show_spinner="正在获取指数估值历史...")
-def get_index_data(code: str) -> pd.DataFrame:
-    errors = []
-    for fetcher in (_fetch_csi, _fetch_lg, _fetch_funddb):
-        try:
-            df = _normalize(fetcher(code))
-            span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
-            if span >= 2 and len(df) >= 400:  # 时间跨度和样本量均合格才采用
-                return df
-            errors.append(f"{fetcher.__name__} 仅返回 {span:.1f} 年 / {len(df)} 条数据")
-        except Exception as e:
-            errors.append(f"{fetcher.__name__}：{e}")
-    raise RuntimeError("；".join(errors))
+def _fetch_csi(code: str) -> pd.DataFrame:
+    """
+    中证官网接口。注意：新版 index_value_csindex 的参数是 (symbol, date_range)，
+    不显式传 date_range 时默认只返回「近1月」（约20条），
+    因此按区间从长到短依次尝试，取第一个合格结果。
+    """
+    func_new = getattr(ak, "index_value_csindex", None)
+    if func_new is not None:
+        has_dr = "date_range" in inspect.signature(func_new).parameters
+        last_err = None
+        for dr in ("all", "5year", "3year"):
+            try:
+                df = _normalize(func_new(code, date_range=dr) if has_dr else func_new(code))
+                span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
+                if span >= 2 and len(df) >= 400:   # 与主流程同样的合格标准
+                    return df
+                last_err = f"date_range={dr} 仅返回 {span:.1f} 年 / {len(df)} 条"
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"新接口无合格数据：{last_err}")
+
+    # 旧版接口兜底（返回2005年至2021年的历史，滞后提示会自动预警）
+    func_old = getattr(ak, "stock_zh_index_value_csindex", None)
+    if func_old is not None:
+        return func_old(symbol=code)
+    raise RuntimeError("中证指数新旧接口均不可用")
+
 
 # ---------- 10年期国债收益率序列 ----------
 @st.cache_data(ttl=3600, show_spinner="正在获取国债收益率...")
