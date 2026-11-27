@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 # ---------------- 页面基础设置 ----------------
 st.set_page_config(page_title="指数估值看板", page_icon="📊", layout="wide")
 
-# ---------------- 指数池：想增删指数，直接改这个字典 ----------------
+# ---------------- 指数池 ----------------
 INDEX_POOL = {
     "000300": "沪深300",
     "000016": "上证50",
@@ -21,7 +21,6 @@ INDEX_POOL = {
 
 # ================== 数据层 ==================
 
-# ---------- 列名统一 ----------
 def _normalize(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = [str(c) for c in df.columns]
     date_col = next((c for c in ["trade_date", "date", "日期", "交易日"] if c in df.columns), None)
@@ -32,27 +31,30 @@ def _normalize(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"列名不匹配，实际列名为：{list(df.columns)}")
     df[date_col] = pd.to_datetime(df[date_col])
     df = df.rename(columns={date_col: "trade_date", pe_col: "pe_ttm"})
-    df = df[df["pe_ttm"] > 0]  # 防御 PE=0 产生 inf
+    df = df[df["pe_ttm"] > 0]
     return df.sort_values("trade_date").dropna(subset=["pe_ttm"]).reset_index(drop=True)
 
-# ---------- 数据源①：中证指数官网（主源） ----------
+# ---------- 数据源①：中证指数官网（主源，显式传入日期区间） ----------
 def _fetch_csi(code: str) -> pd.DataFrame:
-    if hasattr(ak, "index_value_csindex"):
-        func = ak.index_value_csindex
-    else:
-        func = ak.stock_zh_index_value_csindex
+    func_new = getattr(ak, "index_value_csindex", None)
+    if func_new is not None:
+        has_dr = "date_range" in inspect.signature(func_new).parameters
+        last_err = None
+        for dr in ("all", "5year", "3year"):
+            try:
+                df = _normalize(func_new(code, date_range=dr) if has_dr else func_new(code))
+                span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
+                if span >= 2 and len(df) >= 400:
+                    return df
+                last_err = f"date_range={dr} 仅返回 {span:.1f} 年 / {len(df)} 条"
+            except Exception as e:
+                last_err = str(e)
+        raise RuntimeError(f"新接口无合格数据：{last_err}")
 
-    # 自动探测接口支持的日期参数，显式要「成立以来」全部数据
-    kwargs = {}
-    params = inspect.signature(func).parameters
-    if "start_date" in params:
-        kwargs["start_date"] = "20040101"
-    if "end_date" in params:
-        kwargs["end_date"] = pd.Timestamp.today().strftime("%Y%m%d")
-    try:
-        return func(symbol=code, **kwargs)
-    except TypeError:
-        return func(code, **kwargs)
+    func_old = getattr(ak, "stock_zh_index_value_csindex", None)
+    if func_old is not None:
+        return func_old(symbol=code)
+    raise RuntimeError("中证指数新旧接口均不可用")
 
 # ---------- 数据源②：乐咕乐股（备用） ----------
 LG_FUNC_NAMES = ["index_pe_lg", "stock_index_pe_lg"]
@@ -76,7 +78,7 @@ def _fetch_lg(code: str) -> pd.DataFrame:
             last_err = e
     raise RuntimeError(f"不可用：{last_err}")
 
-# ---------- 数据源③：韭圈儿（备用，覆盖主题指数） ----------
+# ---------- 数据源③：韭圈儿（备用） ----------
 FUNDDB_NAME_MAP = {
     "000922": "中证红利", "000015": "上证红利", "000932": "中证消费",
     "000300": "沪深300", "000905": "中证500", "000016": "上证50",
@@ -94,40 +96,22 @@ def _fetch_funddb(code: str) -> pd.DataFrame:
     except TypeError:
         return func(FUNDDB_NAME_MAP[code], "市盈率")
 
-# ---------- 主取数入口：三级回退 ----------
 @st.cache_data(ttl=3600, show_spinner="正在获取指数估值历史...")
-def _fetch_csi(code: str) -> pd.DataFrame:
-    """
-    中证官网接口。注意：新版 index_value_csindex 的参数是 (symbol, date_range)，
-    不显式传 date_range 时默认只返回「近1月」（约20条），
-    因此按区间从长到短依次尝试，取第一个合格结果。
-    """
-    func_new = getattr(ak, "index_value_csindex", None)
-    if func_new is not None:
-        has_dr = "date_range" in inspect.signature(func_new).parameters
-        last_err = None
-        for dr in ("all", "5year", "3year"):
-            try:
-                df = _normalize(func_new(code, date_range=dr) if has_dr else func_new(code))
-                span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
-                if span >= 2 and len(df) >= 400:   # 与主流程同样的合格标准
-                    return df
-                last_err = f"date_range={dr} 仅返回 {span:.1f} 年 / {len(df)} 条"
-            except Exception as e:
-                last_err = str(e)
-        raise RuntimeError(f"新接口无合格数据：{last_err}")
+def get_index_data(code: str) -> pd.DataFrame:
+    errors = []
+    for fetcher in (_fetch_csi, _fetch_lg, _fetch_funddb):
+        try:
+            df = _normalize(fetcher(code))
+            span = (df["trade_date"].iloc[-1] - df["trade_date"].iloc[0]).days / 365.25
+            if span >= 2 and len(df) >= 400:
+                return df
+            errors.append(f"{fetcher.__name__} 仅返回 {span:.1f} 年 / {len(df)} 条数据")
+        except Exception as e:
+            errors.append(f"{fetcher.__name__}：{e}")
+    raise RuntimeError("；".join(errors))
 
-    # 旧版接口兜底（返回2005年至2021年的历史，滞后提示会自动预警）
-    func_old = getattr(ak, "stock_zh_index_value_csindex", None)
-    if func_old is not None:
-        return func_old(symbol=code)
-    raise RuntimeError("中证指数新旧接口均不可用")
-
-
-# ---------- 10年期国债收益率序列 ----------
 @st.cache_data(ttl=3600, show_spinner="正在获取国债收益率...")
 def get_bond_series() -> pd.Series:
-    # akshare 1.20.41 起，bond_zh_us_rate 更名为 bond_zh_us_yield_em
     try:
         bond = ak.bond_zh_us_yield_em()
     except AttributeError:
@@ -143,18 +127,16 @@ def get_bond_series() -> pd.Series:
     s = bond[[date_col, candidates[0]]].dropna().copy()
     s[date_col] = pd.to_datetime(s[date_col])
     s = s.set_index(date_col)[candidates[0]].astype(float).sort_index()
-    if s.iloc[-1] > 0.5:   # 单位自适应：百分数 → 小数
+    if s.iloc[-1] > 0.5:
         s = s / 100
     return s
 
 # ================== 指标计算层 ==================
 
 def pct_rank(series: pd.Series, value: float) -> float:
-    """当前值在历史序列中的百分位（0~100）"""
     return round((series < value).mean() * 100, 1)
 
 def level(pct: float):
-    """根据百分位返回（评级文字, 颜色）"""
     if pct < 30:
         return "🟢 低估", "#43a047"
     if pct < 70:
@@ -180,25 +162,19 @@ def get_metrics(code: str, years: int, r10: float) -> dict:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_spread_history(code: str) -> pd.DataFrame:
-    """某指数每个交易日的股债利差及成立以来百分位"""
     df = get_index_data(code)
     bond = get_bond_series()
     sub = df[["trade_date", "pe_ttm"]].set_index("trade_date").copy()
     sub["盈利收益率"] = 1 / sub["pe_ttm"]
-
-    # 国债收益率按日期对齐，缺失日沿用最近一天
     sub["r10"] = bond.reindex(sub.index, method="ffill")
     sub = sub.dropna(subset=["r10"])
     sub["股债利差"] = sub["盈利收益率"] - sub["r10"]
-
-    # 成立以来百分位：min_periods=250（约一年），此前保持 NaN，避免开头分位随机跳变
     sub["百分位"] = sub["股债利差"].expanding(min_periods=250).rank(pct=True) * 100
     return sub.reset_index()
 
 # ================== 图表层 ==================
 
 def gauge(name: str, pct: float) -> go.Figure:
-    """单只指数的估值温度计"""
     _, color = level(pct)
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
@@ -219,16 +195,15 @@ def gauge(name: str, pct: float) -> go.Figure:
     return fig
 
 def spread_chart(hist: pd.DataFrame) -> go.Figure:
-    """浅网格 + 柔和分段色 + 线端数值 + 图例置于图下方横排"""
     cur = float(hist["股债利差"].iloc[-1])
     cur_pct = hist["百分位"].iloc[-1]
     end_date = hist["trade_date"].iloc[-1]
 
     def color_for(p):
         if pd.isna(p): return "#9aa5b1"
-        if p >= 75:    return "#43a047"   # 利差高位 → 便宜 → 绿
-        if p <= 25:    return "#e53935"   # 利差低位 → 贵 → 红
-        return "#1e88e5"                  # 中性 → 蓝
+        if p >= 75:    return "#43a047"
+        if p <= 25:    return "#e53935"
+        return "#1e88e5"
 
     hist = hist.copy()
     hist["颜色"] = hist["百分位"].apply(color_for)
@@ -247,7 +222,6 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
             ))
             start = i
 
-    # 线端最新值标签（百分位为 NaN 时显示「样本不足」）
     pct_txt = "样本不足" if pd.isna(cur_pct) else f"{cur_pct:.0f}%分位"
     fig.add_annotation(
         x=end_date, y=cur, xanchor="left", xshift=4,
@@ -255,7 +229,6 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
         showarrow=False, font=dict(color=color_for(cur_pct), size=11),
     )
 
-    # 横轴：按跨度自动均分刻度
     span_years = (end_date - hist["trade_date"].iloc[0]).days / 365.25
     step = min([0.5, 1, 2, 5, 10, 20], key=lambda v: abs(v - span_years / 8))
 
@@ -281,18 +254,12 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
     )
     fig.update_layout(
         height=380, hovermode="x unified",
-        margin=dict(t=40, b=60, l=10, r=42),   # 底部留白给图例，右侧仅留线端标签空间
+        margin=dict(t=40, b=60, l=10, r=42),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(
-            orientation="h",            # 水平排列
-            yanchor="bottom", y=-0.22,  # 移到图表下方
-            xanchor="left", x=0,
-            font=dict(size=11, color="#546e7a"),
-            itemsizing="constant",
-        ),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.22, xanchor="left", x=0,
+                    font=dict(size=11, color="#546e7a"), itemsizing="constant"),
     )
 
-    # 图例（短文案，适配手机横排）
     for label, c in [("高位 = 便宜", "#43a047"), ("中性", "#1e88e5"), ("低位 = 贵", "#e53935")]:
         fig.add_trace(go.Scatter(
             x=[None], y=[None], mode="markers",
@@ -304,7 +271,6 @@ def spread_chart(hist: pd.DataFrame) -> go.Figure:
 st.title("📊 指数估值看板")
 st.caption("数据来源：中证指数官网 | 缓存1小时，可在左侧强制刷新")
 
-# ---------------- 侧边栏 ----------------
 with st.sidebar:
     st.header("⚙️ 设置")
     selected = st.multiselect(
@@ -328,7 +294,6 @@ if bond_series.empty:
     st.stop()
 r10 = float(bond_series.iloc[-1])
 
-# ---------------- 逐个计算指标（线程池并行，首次加载更快） ----------------
 def _safe_metrics(code):
     try:
         return get_metrics(code, years, r10), None
@@ -346,13 +311,11 @@ for _, msg in results:
 if not metrics_list:
     st.stop()
 
-# ---------------- 数据滞后提示 ----------------
 latest = max(pd.to_datetime(m["数据日期"]) for m in metrics_list)
 lag_days = (pd.Timestamp.today().normalize() - latest).days
 if lag_days > 7:
     st.warning(f"⚠️ 最新数据日期为 {latest:%Y-%m-%d}，已滞后 {lag_days} 天，数据源可能停更")
 
-# ---------------- 顶部：整体股债性价比 ----------------
 avg_graham = sum(m["格雷厄姆指数"] for m in metrics_list) / len(metrics_list)
 c1, c2, c3 = st.columns(3)
 c1.metric("10 年期国债收益率", f"{r10:.2%}")
@@ -361,7 +324,6 @@ c3.metric("整体评价", "🟢 股优于债" if avg_graham > 2 else "🔴 债�
 
 st.divider()
 
-# ---------------- 汇总表格 ----------------
 st.subheader("📋 指标汇总")
 pct_col = f"百分位({years}年)"
 table = pd.DataFrame([
@@ -396,7 +358,6 @@ st.download_button(
 )
 st.caption("百分位越低 = 当前估值在历史上越便宜；股债利差 = 盈利收益率 − 10Y国债收益率")
 
-# ---------------- 温度计 ----------------
 st.subheader("🌡️ 估值温度计")
 for i in range(0, len(metrics_list), 2):
     pair = metrics_list[i : i + 2]
@@ -405,7 +366,6 @@ for i in range(0, len(metrics_list), 2):
         with col:
             st.plotly_chart(gauge(m["指数"], m["百分位"]), use_container_width=True)
 
-# ---------------- 股债利差历史走势 ----------------
 st.divider()
 st.subheader("📈 股债利差走势（指数成立以来）")
 st.caption("股债利差 = 盈利收益率(1/PE) − 10年期国债收益率 ｜ 🟢 利差高位＝相对便宜 · 🔵 中性 · 🔴 利差低位＝相对昂贵")
